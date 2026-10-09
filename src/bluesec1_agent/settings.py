@@ -82,6 +82,18 @@ class Settings(BaseSettings):
         validation_alias="BLUESEC_AGENT_MAX_TASK_SECONDS",
         gt=0,
     )
+    agent_task_concurrency: int = Field(
+        default=1,
+        validation_alias="BLUESEC_AGENT_TASK_CONCURRENCY",
+        ge=1,
+        le=8,
+    )
+    agent_analysis_parallelism: int = Field(
+        default=2,
+        validation_alias="BLUESEC_AGENT_ANALYSIS_PARALLELISM",
+        ge=1,
+        le=2,
+    )
     agent_trace_dir: Path = Field(
         default=Path("runs/traces"),
         validation_alias="BLUESEC_AGENT_TRACE_DIR",

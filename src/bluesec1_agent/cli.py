@@ -39,6 +39,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Stop cleanly after this many tasks (useful for a short practice run).",
     )
     parser.add_argument(
+        "--task-concurrency",
+        type=int,
+        help="Override BLUESEC_AGENT_TASK_CONCURRENCY.",
+    )
+    parser.add_argument(
         "--verify-tls",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -90,6 +95,8 @@ async def run(args: argparse.Namespace) -> None:
             max_steps=settings.agent_max_steps,
             max_task_seconds=settings.agent_max_task_seconds,
             max_tasks=args.max_tasks,
+            task_concurrency=args.task_concurrency or settings.agent_task_concurrency,
+            analysis_parallelism=settings.agent_analysis_parallelism,
             trace_dir=settings.agent_trace_dir,
         ).run(client)
 

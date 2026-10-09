@@ -151,6 +151,21 @@ class FakeClient:
         return cast(RemoteBenchmarkSession, session)
 
 
+class MultiFakeClient:
+    """Queue-backed fake used to verify batch task leasing."""
+
+    def __init__(self, sessions: list[FakeSession]) -> None:
+        self.run = SimpleNamespace(run_id="run-many")
+        self.sessions = list(sessions)
+        self.lease_calls = 0
+
+    async def start_task(self) -> RemoteBenchmarkSession | None:
+        self.lease_calls += 1
+        if not self.sessions:
+            return None
+        return cast(RemoteBenchmarkSession, self.sessions.pop(0))
+
+
 def test_agent_executes_fresh_structured_task_via_remote_session(tmp_path: Path) -> None:
     """Tool evidence should feed the next step before the terminal action."""
     llm = FakeStepClient(
@@ -370,3 +385,88 @@ def test_final_report_gets_one_local_review_before_submission() -> None:
         review_prompt["investigation_state"]["last_tool_feedback"]["status"]
         == "review_required"
     )
+
+
+def test_run_leases_two_tasks_per_batch() -> None:
+    def finish_step() -> NextStep:
+        return NextStep(
+            current_state="Test report ready.",
+            plan_remaining_steps_brief=["Finish."],
+            task_completed=True,
+            function=FinishInvestigationRequest(
+                tool="finish_investigation",
+                submission=MaliciousFinishInvestigationSubmission(
+                    verdict="malicious",
+                    ir_artifacts=[
+                        FinishInvestigationArtifact(
+                            entity_id="host-1",
+                            kind="host_to_isolate",
+                        )
+                    ],
+                    reasoning="Supported test verdict.",
+                ),
+            ),
+        )
+
+    llm = FakeStepClient([finish_step(), finish_step()])
+    sessions = [FakeSession(), FakeSession()]
+    client = MultiFakeClient(sessions)
+
+    result = asyncio.run(
+        SimpleSGRAgent(
+            llm,
+            max_steps=1,
+            max_tasks=2,
+            review_final_report=False,
+            task_concurrency=2,
+        ).run(cast(RemoteBenchmarkClient, client))
+    )
+
+    assert len(result.task_results) == 2
+    assert client.lease_calls == 2
+    assert all(session.calls[0][0] == "finish_investigation" for session in sessions)
+
+
+def test_parallel_hypotheses_are_arbitrated_into_one_step() -> None:
+    malicious = NextStep(
+        current_state="Malicious hypothesis.",
+        plan_remaining_steps_brief=["Inspect entity."],
+        task_completed=False,
+        function=GetEntityRequest(
+            tool="get_entity",
+            entity_id="entity-malicious",
+            reasoning="Test malicious branch.",
+        ),
+    )
+    benign = NextStep(
+        current_state="Benign hypothesis.",
+        plan_remaining_steps_brief=["Inspect entity."],
+        task_completed=False,
+        function=GetEntityRequest(
+            tool="get_entity",
+            entity_id="entity-benign",
+            reasoning="Test benign branch.",
+        ),
+    )
+    arbiter = malicious.model_copy(
+        update={"current_state": "Arbiter selected the discriminating branch."}
+    )
+    llm = FakeStepClient([malicious, benign, arbiter])
+    agent = SimpleSGRAgent(llm, analysis_parallelism=2)
+
+    selected = asyncio.run(
+        agent._next_step_with_candidates(
+            [
+                {"role": "system", "content": "Investigate."},
+                {"role": "user", "content": "Evidence."},
+            ],
+            roles=("malicious analyst", "benign analyst"),
+            task_id="task-1",
+            decision_index=1,
+        )
+    )
+
+    assert selected.current_state == "Arbiter selected the discriminating branch."
+    assert len(llm.requests) == 3
+    arbitration = json.loads(llm.requests[2][-1]["content"])
+    assert len(arbitration["specialist_candidates"]) == 2

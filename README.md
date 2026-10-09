@@ -32,6 +32,9 @@ it is shown next to your runs in the competition interface.
 Pin `SCENARIO_RUNTIME_ARENA=practice` while testing, then explicitly change it
 for the final arena. The agent defaults to 24 calls and 240 seconds per task;
 both limits are configurable in `.env`.
+The current competition runtime permits one active task per run. Inside that task,
+the agent uses two parallel hypothesis candidates at the initial decision and final
+report audit. Both concurrency values remain configurable in `.env`.
 
 Start the agent with `--env-file` so gRPC receives the resolver setting from
 the environment as well as the application settings.

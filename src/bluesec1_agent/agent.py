@@ -8,12 +8,13 @@ from loguru import logger
 from pydantic import BaseModel, ConfigDict, Field
 
 from bluesec1_agent.llm import StructuredStepClient, render_json
-from bluesec1_agent.models import FinishInvestigationRequest
+from bluesec1_agent.models import FinishInvestigationRequest, NextStep
 from bluesec1_agent.state import EvidenceLedger
 from bluesec1_agent.trace import JsonlTraceWriter
 from bluesec1_client import (
     RemoteBenchmarkClient,
     RemoteBenchmarkSession,
+    TaskCapacityExceededError,
     TaskResult,
     ToolCallResult,
 )
@@ -93,6 +94,8 @@ class SimpleSGRAgent:
         max_task_seconds: float = 240.0,
         max_tasks: int | None = None,
         review_final_report: bool = True,
+        task_concurrency: int = 1,
+        analysis_parallelism: int = 1,
         trace_dir: Path | None = None,
     ) -> None:
         """Store the LLM dependency and per-task step limit.
@@ -102,6 +105,8 @@ class SimpleSGRAgent:
             max_steps: Maximum total tool calls allowed for one task.
             max_tasks: Optional number of tasks to consume before closing the run.
             review_final_report: Require one evidence audit before remote submission.
+            task_concurrency: Maximum independently investigated tasks in flight.
+            analysis_parallelism: Number of parallel hypothesis candidates at key decisions.
 
         Raises:
             ValueError: If the configured limit is not positive.
@@ -112,11 +117,17 @@ class SimpleSGRAgent:
             raise ValueError("max_task_seconds must be positive")
         if max_tasks is not None and max_tasks < 1:
             raise ValueError("max_tasks must be positive when provided")
+        if task_concurrency < 1:
+            raise ValueError("task_concurrency must be positive")
+        if analysis_parallelism < 1:
+            raise ValueError("analysis_parallelism must be positive")
         self.llm = llm
         self.max_steps = max_steps
         self.max_task_seconds = max_task_seconds
         self.max_tasks = max_tasks
         self.review_final_report = review_final_report
+        self.task_concurrency = task_concurrency
+        self.analysis_parallelism = analysis_parallelism
         self.trace_dir = trace_dir
         self._trace: JsonlTraceWriter | None = None
 
@@ -141,30 +152,41 @@ class SimpleSGRAgent:
             self._write_trace("run_started", run_id=remote_run.run_id)
 
         task_results: list[TaskResult] = []
-        while (session := await client.start_task()) is not None:
-            logger.info("Starting structured investigation for task {}.", session.task_id)
-            self._write_trace("task_started", task_id=session.task_id)
-            try:
-                async with asyncio.timeout(self.max_task_seconds):
-                    task_result = await self._investigate(session)
-            except Exception as exc:
-                logger.error("Task {} failed in the agent: {}", session.task_id, exc)
-                error_message = f"{type(exc).__name__}: {exc}"[:2_000]
-                aborted_result = await session.abort_task(error_message=error_message)
-                task_result = TaskResult.model_validate(aborted_result)
-                self._write_trace(
-                    "task_error",
-                    task_id=session.task_id,
-                    error=error_message,
-                )
-                if self._is_fatal_provider_error(exc):
-                    self._write_trace("task_result", result=task_result.model_dump(mode="json"))
-                    raise
-            task_results.append(task_result)
-            self._write_trace("task_result", result=task_result.model_dump(mode="json"))
-            if self.max_tasks is not None and len(task_results) >= self.max_tasks:
+        queue_exhausted = False
+        while not queue_exhausted:
+            remaining = (
+                self.task_concurrency
+                if self.max_tasks is None
+                else min(self.task_concurrency, self.max_tasks - len(task_results))
+            )
+            if remaining <= 0:
                 logger.info("Reached configured run limit of {} task(s).", self.max_tasks)
                 break
+
+            sessions: list[RemoteBenchmarkSession] = []
+            for _ in range(remaining):
+                try:
+                    session = await client.start_task()
+                except TaskCapacityExceededError as exc:
+                    logger.info(
+                        "Runtime active-task limit reached at concurrency {}; "
+                        "processing the leased batch first.",
+                        len(sessions),
+                    )
+                    if not sessions:
+                        raise exc
+                    break
+                if session is None:
+                    queue_exhausted = True
+                    break
+                sessions.append(session)
+
+            if not sessions:
+                break
+            batch_results = await asyncio.gather(
+                *(self._run_task(session) for session in sessions)
+            )
+            task_results.extend(batch_results)
 
         successful_tasks = sum(
             result.completion_reason in {"terminated", "truncated"} for result in task_results
@@ -177,6 +199,29 @@ class SimpleSGRAgent:
         )
         self._write_trace("run_finished", result=result.model_dump(mode="json"))
         return result
+
+    async def _run_task(self, session: RemoteBenchmarkSession) -> TaskResult:
+        """Investigate one leased session and convert task-local failures to aborts."""
+        logger.info("Starting structured investigation for task {}.", session.task_id)
+        self._write_trace("task_started", task_id=session.task_id)
+        try:
+            async with asyncio.timeout(self.max_task_seconds):
+                task_result = await self._investigate(session)
+        except Exception as exc:
+            logger.error("Task {} failed in the agent: {}", session.task_id, exc)
+            error_message = f"{type(exc).__name__}: {exc}"[:2_000]
+            aborted_result = await session.abort_task(error_message=error_message)
+            task_result = TaskResult.model_validate(aborted_result)
+            self._write_trace(
+                "task_error",
+                task_id=session.task_id,
+                error=error_message,
+            )
+            if self._is_fatal_provider_error(exc):
+                self._write_trace("task_result", result=task_result.model_dump(mode="json"))
+                raise
+        self._write_trace("task_result", result=task_result.model_dump(mode="json"))
+        return task_result
 
     async def _investigate(self, session: RemoteBenchmarkSession) -> TaskResult:
         """Drive one leased task until its terminal investigation tool succeeds.
@@ -230,7 +275,26 @@ class SimpleSGRAgent:
                 calls_remaining=calls_remaining,
                 seconds_remaining=seconds_remaining,
             )
-            step = await self.llm.next_step(messages)
+            parallel_roles: tuple[str, ...] = ()
+            if decision_index == 1:
+                parallel_roles = (
+                    "Argue the strongest malicious hypothesis and choose the single tool call "
+                    "that can confirm or refute it most efficiently.",
+                    "Argue the strongest benign hypothesis using positive evidence and choose "
+                    "the single tool call that best distinguishes it from an attack.",
+                )
+            elif last_feedback and last_feedback.get("status") == "review_required":
+                parallel_roles = (
+                    "Audit verdict correctness and identify unsupported or contradictory claims.",
+                    "Audit artifact and legitimacy-evidence completeness, IDs, fields, and "
+                    "causal relations.",
+                )
+            step = await self._next_step_with_candidates(
+                messages,
+                roles=parallel_roles,
+                task_id=session.task_id,
+                decision_index=decision_index,
+            )
             current_state = step.current_state
             function = step.function
             validation_errors: list[str] = []
@@ -433,6 +497,55 @@ class SimpleSGRAgent:
     def _call_fingerprint(tool_name: str, arguments: dict[str, Any]) -> str:
         semantic_arguments = {key: value for key, value in arguments.items() if key != "reasoning"}
         return f"{tool_name}:{json.dumps(semantic_arguments, sort_keys=True, default=str)}"
+
+    async def _next_step_with_candidates(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        roles: tuple[str, ...],
+        task_id: str,
+        decision_index: int,
+    ) -> NextStep:
+        """Generate parallel hypotheses and arbitrate one executable next step."""
+        selected_roles = roles[: self.analysis_parallelism]
+        if len(selected_roles) < 2:
+            return await self.llm.next_step(messages)
+
+        async def candidate(role: str) -> NextStep:
+            role_messages = [dict(message) for message in messages]
+            role_messages[0] = {
+                **role_messages[0],
+                "content": f"{role_messages[0]['content']}\n\nSpecialist role: {role}",
+            }
+            return await self.llm.next_step(role_messages)
+
+        candidates = await asyncio.gather(*(candidate(role) for role in selected_roles))
+        candidate_payloads = [item.model_dump(mode="json", by_alias=True) for item in candidates]
+        self._write_trace(
+            "analyst_candidates",
+            task_id=task_id,
+            step=decision_index,
+            roles=list(selected_roles),
+            candidates=candidate_payloads,
+        )
+        arbitration_messages = [dict(message) for message in messages]
+        arbitration_messages.append(
+            {
+                "role": "user",
+                "content": render_json(
+                    {
+                        "instruction": (
+                            "Act as senior arbiter. Compare the specialist candidates against "
+                            "the evidence ledger. Return one corrected NextStep. Prefer the call "
+                            "with highest expected impact on verdict or report completeness; do "
+                            "not combine multiple tool calls."
+                        ),
+                        "specialist_candidates": candidate_payloads,
+                    }
+                ),
+            }
+        )
+        return await self.llm.next_step(arbitration_messages)
 
     @staticmethod
     def _compact_arguments(arguments: dict[str, Any]) -> dict[str, Any]:

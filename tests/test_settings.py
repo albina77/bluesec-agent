@@ -40,6 +40,8 @@ def test_env_example_contains_complete_runnable_configuration() -> None:
     assert settings.llm_default_model == "provider/model-name"
     assert settings.agent_max_steps == 24
     assert settings.agent_max_task_seconds == 240
+    assert settings.agent_task_concurrency == 1
+    assert settings.agent_analysis_parallelism == 2
 
 
 def test_missing_configuration_is_reported_without_traceback(monkeypatch, capsys):
