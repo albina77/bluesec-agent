@@ -43,8 +43,12 @@ Investigation rules:
 - Do not repeat an identical unhelpful or failed call.
 - Use only entity_id values actually returned by the alert or by a tool.
 - Submit only response artifacts supported by evidence. Do not invent entity ids.
-- Aim to finish in 6-10 total tool calls. Exceed that only when a concrete unresolved
-  evidence gap can change the verdict or add a necessary response artifact.
+- Tool-call efficiency is not penalized while calls stay within the scenario's hidden
+  budget. Do not stop merely to hit an arbitrary call count. Continue while a concrete
+  evidence gap can change the verdict, establish causality, or add a necessary artifact.
+- Stop when both hypotheses have been tested and the verdict, causal chain, actor,
+  affected assets, and report artifacts are supported. Do not exhaust the graph after
+  those report-critical questions are answered.
 - Keep current_state evidence-focused and the remaining plan short.
 - Set task_completed=true exactly when selecting finish_investigation.
 - Treat null or missing properties as unknown, never as negative evidence.
@@ -85,7 +89,7 @@ class SimpleSGRAgent:
         self,
         llm: StructuredStepClient,
         *,
-        max_steps: int = 10,
+        max_steps: int = 24,
         max_task_seconds: float = 240.0,
         max_tasks: int | None = None,
         review_final_report: bool = True,
@@ -208,7 +212,7 @@ class SimpleSGRAgent:
         last_feedback: dict[str, Any] | None = None
         started_at = time.monotonic()
         remote_calls = 0
-        max_decisions = max(self.max_steps * 2, self.max_steps + 6)
+        max_decisions = self.max_steps + 10
         final_review_complete = not self.review_final_report
 
         for decision_index in range(1, max_decisions + 1):

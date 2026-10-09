@@ -30,7 +30,7 @@ competition site, and `LLM_BASE_URL`,
 `LLM_API_KEY`, `LLM_DEFAULT_MODEL` from your provider. Set `AGENT_NAME` too —
 it is shown next to your runs in the competition interface.
 Pin `SCENARIO_RUNTIME_ARENA=practice` while testing, then explicitly change it
-for the final arena. The agent defaults to 10 calls and 240 seconds per task;
+for the final arena. The agent defaults to 24 calls and 240 seconds per task;
 both limits are configurable in `.env`.
 
 Start the agent with `--env-file` so gRPC receives the resolver setting from
