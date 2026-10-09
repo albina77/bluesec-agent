@@ -33,6 +33,17 @@ class EvidenceLedger:
             "relations": [self.relations[key] for key in sorted(self.relations)],
             "known_entity_ids": sorted(self.entity_ids),
             "known_relation_ids": sorted(self.relation_ids),
+            "unexplored_entity_ids": sorted(self.entity_ids - self.entities.keys()),
+            "unexplored_relation_ids": sorted(self.relation_ids - self.relations.keys()),
+            "reportable_non_null_fields": {
+                record_id: sorted(
+                    field
+                    for field in fields
+                    if self._field_value(record_id, field) is not None
+                )
+                for record_id, fields in sorted(self.property_fields.items())
+            },
+            "analyst_attention": self._attention_signals(),
         }
 
     def validate_finish(self, request: FinishInvestigationRequest) -> list[str]:
@@ -82,6 +93,7 @@ class EvidenceLedger:
         notes: list[str] = []
         anchors: list[str] = []
         normalized_evidence = []
+        has_relation_anchor = False
         for evidence in submission.legitimacy_evidence:
             if evidence.anchor == "entity":
                 anchor_id = evidence.entity_id
@@ -89,13 +101,18 @@ class EvidenceLedger:
                 if anchor_id not in self.entity_ids:
                     errors.append(f"legitimacy entity_id {anchor_id!r} was not observed")
             else:
+                has_relation_anchor = True
                 anchor_id = evidence.relation_id
                 anchor_key = f"relation:{anchor_id}"
                 if anchor_id not in self.relation_ids:
                     errors.append(f"legitimacy relation_id {anchor_id!r} was not observed")
             anchors.append(anchor_key)
 
-            known_fields = self.property_fields.get(anchor_id, set())
+            known_fields = {
+                field
+                for field in self.property_fields.get(anchor_id, set())
+                if self._field_value(anchor_id, field) is not None
+            }
             valid_fields = [
                 field for field in evidence.property_fields if field in known_fields
             ]
@@ -115,6 +132,11 @@ class EvidenceLedger:
                 )
 
         errors.extend(self._duplicate_errors(anchors, "legitimacy anchor"))
+        if self.relations and not has_relation_anchor:
+            errors.append(
+                "benign report must cite at least one observed causal relation; choose the "
+                "strongest relation that supports the legitimate sequence"
+            )
         normalized_submission = submission.model_copy(
             update={"legitimacy_evidence": normalized_evidence}
         )
@@ -136,6 +158,11 @@ class EvidenceLedger:
             return
         if not isinstance(value, dict):
             return
+
+        if parent_key and parent_key.endswith("entity_ids"):
+            self.entity_ids.update(self._nested_strings(value))
+        elif parent_key and parent_key.endswith("relation_ids"):
+            self.relation_ids.update(self._nested_strings(value))
 
         record_id = value.get("id")
         if isinstance(record_id, str):
@@ -182,6 +209,106 @@ class EvidenceLedger:
             if isinstance(nested, dict):
                 names.update(nested)
         return names
+
+    def _field_value(self, record_id: str, field: str) -> Any:
+        record = self.entities.get(record_id) or self.relations.get(record_id) or {}
+        if field in record:
+            return record[field]
+        for container in ("properties", "logon_properties", "access_properties"):
+            nested = record.get(container)
+            if isinstance(nested, dict) and field in nested:
+                return nested[field]
+        return None
+
+    def _attention_signals(self) -> list[dict[str, str]]:
+        """Surface high-signal observed behavior without assigning a verdict."""
+        signals: list[dict[str, str]] = []
+        for entity_id, record in self.entities.items():
+            properties = record.get("properties")
+            if not isinstance(properties, dict):
+                continue
+            content = " ".join(
+                str(properties.get(field) or "")
+                for field in ("script_text", "decoded_content", "cmdline")
+            ).lower()
+            if not content.strip():
+                continue
+
+            discovery_terms = {
+                term
+                for term in (
+                    "systeminfo",
+                    "hostname",
+                    "ipconfig",
+                    "tasklist",
+                    "fsutil fsinfo",
+                    "win32_computersystem",
+                )
+                if term in content
+            }
+            evasion_terms = {
+                term
+                for term in (
+                    "vmware",
+                    "virtualbox",
+                    "vboxservice",
+                    "vmtoolsd",
+                    "sandboxie",
+                )
+                if term in content
+            }
+            if len(discovery_terms) >= 3 and evasion_terms:
+                signals.append(
+                    {
+                        "entity_id": entity_id,
+                        "severity": "high",
+                        "observation": (
+                            "Observed script combines broad host discovery with explicit "
+                            "virtualization or sandbox detection: "
+                            f"discovery={sorted(discovery_terms)}, "
+                            f"evasion={sorted(evasion_terms)}"
+                        ),
+                    }
+                )
+
+            execution_terms = {
+                term
+                for term in (
+                    "-encodedcommand",
+                    " -enc ",
+                    "frombase64string",
+                    "downloadstring",
+                    "invoke-expression",
+                    " iwr ",
+                )
+                if term in f" {content} "
+            }
+            if execution_terms:
+                signals.append(
+                    {
+                        "entity_id": entity_id,
+                        "severity": "high",
+                        "observation": (
+                            "Observed encoded or download-and-execute behavior: "
+                            f"{sorted(execution_terms)}"
+                        ),
+                    }
+                )
+        return signals
+
+    @staticmethod
+    def _nested_strings(value: Any) -> set[str]:
+        if isinstance(value, str):
+            return {value}
+        if isinstance(value, list):
+            return set().union(
+                *(EvidenceLedger._nested_strings(item) for item in value), set()
+            )
+        if isinstance(value, dict):
+            return set().union(
+                *(EvidenceLedger._nested_strings(item) for item in value.values()), set()
+            )
+        return set()
 
     @staticmethod
     def _duplicate_errors(values: list[str], label: str) -> list[str]:

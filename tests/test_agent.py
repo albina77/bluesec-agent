@@ -189,7 +189,9 @@ def test_agent_executes_fresh_structured_task_via_remote_session(tmp_path: Path)
     client = FakeClient(session)
 
     result = asyncio.run(
-        SimpleSGRAgent(llm, trace_dir=tmp_path).run(cast(RemoteBenchmarkClient, client))
+        SimpleSGRAgent(llm, review_final_report=False, trace_dir=tmp_path).run(
+            cast(RemoteBenchmarkClient, client)
+        )
     )
 
     assert result.run_id == "run-1"
@@ -268,3 +270,103 @@ def test_tool_feedback_extracts_json_encoded_last_result() -> None:
     feedback = SimpleSGRAgent._tool_feedback(response)
 
     assert feedback["result"] == {"id": "entity-1", "properties": {"pid": 42}}
+
+
+def test_duplicate_decision_uses_cache_without_spending_server_call() -> None:
+    repeated = GetEntityRequest(
+        tool="get_entity",
+        entity_id="entity-1",
+        reasoning="Inspect the same entity.",
+    )
+    llm = FakeStepClient(
+        [
+            NextStep(
+                current_state="Inspecting entity.",
+                plan_remaining_steps_brief=["Inspect entity."],
+                task_completed=False,
+                function=repeated,
+            ),
+            NextStep(
+                current_state="Accidentally repeated entity.",
+                plan_remaining_steps_brief=["Use cached result."],
+                task_completed=False,
+                function=repeated,
+            ),
+            NextStep(
+                current_state="Enough evidence.",
+                plan_remaining_steps_brief=["Finish."],
+                task_completed=True,
+                function=FinishInvestigationRequest(
+                    tool="finish_investigation",
+                    submission=MaliciousFinishInvestigationSubmission(
+                        verdict="malicious",
+                        ir_artifacts=[
+                            FinishInvestigationArtifact(
+                                entity_id="host-1",
+                                kind="host_to_isolate",
+                            )
+                        ],
+                        reasoning="Supported test verdict.",
+                    ),
+                ),
+            ),
+        ]
+    )
+    session = FakeSession()
+
+    asyncio.run(
+        SimpleSGRAgent(llm, max_steps=2, review_final_report=False)._investigate(
+            cast(RemoteBenchmarkSession, session)
+        )
+    )
+
+    assert [name for name, _ in session.calls] == ["get_entity", "finish_investigation"]
+    third_prompt = json.loads(llm.requests[2][-1]["content"])
+    assert third_prompt["budget"]["server_calls_remaining_including_finish"] == 1
+    assert third_prompt["investigation_state"]["last_tool_feedback"]["status"] == "cached"
+
+
+def test_final_report_gets_one_local_review_before_submission() -> None:
+    finish = FinishInvestigationRequest(
+        tool="finish_investigation",
+        submission=MaliciousFinishInvestigationSubmission(
+            verdict="malicious",
+            ir_artifacts=[
+                FinishInvestigationArtifact(
+                    entity_id="host-1",
+                    kind="host_to_isolate",
+                )
+            ],
+            reasoning="Evidence-backed test verdict.",
+        ),
+    )
+    llm = FakeStepClient(
+        [
+            NextStep(
+                current_state="Candidate report ready.",
+                plan_remaining_steps_brief=["Review report."],
+                task_completed=True,
+                function=finish,
+            ),
+            NextStep(
+                current_state="Report audited against evidence.",
+                plan_remaining_steps_brief=["Submit report."],
+                task_completed=True,
+                function=finish,
+            ),
+        ]
+    )
+    session = FakeSession()
+
+    asyncio.run(
+        SimpleSGRAgent(llm, max_steps=1)._investigate(
+            cast(RemoteBenchmarkSession, session)
+        )
+    )
+
+    assert [name for name, _ in session.calls] == ["finish_investigation"]
+    review_prompt = json.loads(llm.requests[1][-1]["content"])
+    assert (
+        review_prompt["investigation_state"]["last_tool_feedback"]["status"]
+        == "review_required"
+    )

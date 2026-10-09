@@ -34,6 +34,11 @@ Investigation rules:
 - Start from the entity ids named in the alert, then expand through their relations.
 - Prefer following relations over searching again: an entity you already hold tells
   you where to go next.
+- Keep two competing hypotheses in current_state: the strongest malicious explanation
+  and the strongest benign explanation. Choose the next call that best separates them.
+- Treat analyst_attention as observed behavior requiring immediate resolution. Stay on
+  that entity's branch; do not wander into unrelated host activity. Broad discovery plus
+  VM or sandbox detection is strong evidence of malicious intent unless directly refuted.
 - Search when you have a concrete string worth looking for and no edge leading to it.
 - Do not repeat an identical unhelpful or failed call.
 - Use only entity_id values actually returned by the alert or by a tool.
@@ -45,11 +50,19 @@ Investigation rules:
 - Treat null or missing properties as unknown, never as negative evidence.
 - A benign verdict requires positive legitimacy evidence; absence of malicious
   evidence is insufficient.
+- Signed Microsoft binaries and common administrative tools do not make their commands
+  benign. Judge intent from arguments, scripts, relations, actor, and sequence.
+- Never cite a null-valued property as evidence and never describe an unknown signature,
+  parent, timestamp, reputation, or user as confirmed.
 - Every final artifact or evidence anchor must use an id and property actually observed.
 - Before a malicious report, consider the affected host, identity, persistence, file,
   network destination, and executed process. Include only supported, actionable items;
   do not pad the report. For benign reports, cite the strongest positive legitimacy
   properties and relations. State material unknowns without turning them into facts.
+- A benign report should normally cite a causal relation plus the strongest non-null
+  entity properties that establish an expected actor, binary, command, and sequence.
+- If the last feedback has status review_required, audit every claim against the
+  evidence ledger, correct the candidate, and return finish_investigation again.
 - Finish before the investigation step budget is exhausted.
 """.strip()
 
@@ -72,9 +85,10 @@ class SimpleSGRAgent:
         self,
         llm: StructuredStepClient,
         *,
-        max_steps: int = 14,
+        max_steps: int = 10,
         max_task_seconds: float = 240.0,
         max_tasks: int | None = None,
+        review_final_report: bool = True,
         trace_dir: Path | None = None,
     ) -> None:
         """Store the LLM dependency and per-task step limit.
@@ -83,6 +97,7 @@ class SimpleSGRAgent:
             llm: Structured step generator used for every investigation turn.
             max_steps: Maximum total tool calls allowed for one task.
             max_tasks: Optional number of tasks to consume before closing the run.
+            review_final_report: Require one evidence audit before remote submission.
 
         Raises:
             ValueError: If the configured limit is not positive.
@@ -97,6 +112,7 @@ class SimpleSGRAgent:
         self.max_steps = max_steps
         self.max_task_seconds = max_task_seconds
         self.max_tasks = max_tasks
+        self.review_final_report = review_final_report
         self.trace_dir = trace_dir
         self._trace: JsonlTraceWriter | None = None
 
@@ -187,14 +203,17 @@ class SimpleSGRAgent:
         ledger = EvidenceLedger()
         ledger.ingest(public_observation)
         calls_made: list[dict[str, Any]] = []
-        call_fingerprints: set[str] = set()
+        call_cache: dict[str, dict[str, Any]] = {}
         current_state = "Only the initial alert has been reviewed."
         last_feedback: dict[str, Any] | None = None
         started_at = time.monotonic()
+        remote_calls = 0
+        max_decisions = max(self.max_steps * 2, self.max_steps + 6)
+        final_review_complete = not self.review_final_report
 
-        for step_index in range(1, self.max_steps + 1):
+        for decision_index in range(1, max_decisions + 1):
             elapsed_seconds = time.monotonic() - started_at
-            steps_remaining = self.max_steps - step_index + 1
+            calls_remaining = self.max_steps - remote_calls
             seconds_remaining = max(0.0, self.max_task_seconds - elapsed_seconds)
             messages = self._step_messages(
                 public_observation=public_observation,
@@ -203,8 +222,8 @@ class SimpleSGRAgent:
                 calls_made=calls_made,
                 current_state=current_state,
                 last_feedback=last_feedback,
-                step_index=step_index,
-                steps_remaining=steps_remaining,
+                decision_index=decision_index,
+                calls_remaining=calls_remaining,
                 seconds_remaining=seconds_remaining,
             )
             step = await self.llm.next_step(messages)
@@ -223,11 +242,13 @@ class SimpleSGRAgent:
                 exclude={"tool"},
                 exclude_none=True,
             )
-            tool_call_id = f"step_{step_index}"
+            fingerprint = self._call_fingerprint(tool_name, arguments)
+            tool_call_id = f"decision_{decision_index}"
+            server_call = False
             self._write_trace(
                 "llm_step",
                 task_id=session.task_id,
-                step=step_index,
+                step=decision_index,
                 current_state=step.current_state,
                 plan=step.plan_remaining_steps_brief,
                 tool_name=tool_name,
@@ -253,21 +274,65 @@ class SimpleSGRAgent:
                     "validation_errors": validation_errors,
                 }
                 logger.warning("Rejected unsupported final report: {}", validation_errors)
+            elif isinstance(function, FinishInvestigationRequest) and not final_review_complete:
+                final_review_complete = True
+                audit_findings = self._report_audit_findings(function)
+                feedback = {
+                    "tool_name": tool_name,
+                    "status": "review_required",
+                    "candidate_submission": arguments["submission"],
+                    "audit_findings": audit_findings,
+                    "message": (
+                        "Audit this candidate before submission. Remove claims supported only "
+                        "by null or missing values. Check verdict consistency, causal relations, "
+                        "actor, command, timeline, and response artifacts. For benign, cite "
+                        "positive legitimacy evidence rather than absence of malicious evidence. "
+                        "Return a corrected finish_investigation next unless one specific missing "
+                        "fact can materially change the verdict."
+                    ),
+                }
+                self._write_trace(
+                    "final_review",
+                    task_id=session.task_id,
+                    step=decision_index,
+                    candidate_submission=arguments["submission"],
+                )
             else:
-                fingerprint = self._call_fingerprint(tool_name, arguments)
-                if tool_name != "finish_investigation" and fingerprint in call_fingerprints:
+                if tool_name != "finish_investigation" and fingerprint in call_cache:
+                    cached = call_cache[fingerprint]
+                    feedback = {
+                        "tool_name": tool_name,
+                        "status": "cached",
+                        "reward": cached.get("reward"),
+                        "message": (
+                            "This exact call already ran and its evidence is in the ledger. "
+                            "Do not request it again. Follow an unexplored relation, test the "
+                            "opposing hypothesis, or finish now."
+                        ),
+                    }
+                    logger.info("Served duplicate {} from local cache.", tool_name)
+                    self._write_trace(
+                        "cache_hit",
+                        task_id=session.task_id,
+                        step=decision_index,
+                        tool_name=tool_name,
+                        arguments=arguments,
+                    )
+                elif tool_name != "finish_investigation" and calls_remaining <= 1:
                     feedback = {
                         "tool_name": tool_name,
                         "status": "error",
                         "message": (
-                            "Identical call already executed; choose a different evidence gap."
+                            "The final server call is reserved for finish_investigation. "
+                            "Submit the best supported report now."
                         ),
                     }
-                    logger.warning("Rejected duplicate tool call {} locally.", tool_name)
                 else:
-                    call_fingerprints.add(fingerprint)
+                    remote_calls += 1
+                    server_call = True
                     response = await session.call_tool(tool_name, arguments)
                     feedback = self._tool_feedback(response)
+                    call_cache[fingerprint] = feedback
                     ledger.ingest(feedback.get("result"))
                     logger.info(
                         "Tool {} returned status {}.",
@@ -277,7 +342,7 @@ class SimpleSGRAgent:
                     self._write_trace(
                         "tool_result",
                         task_id=session.task_id,
-                        step=step_index,
+                        step=decision_index,
                         tool_call_id=tool_call_id,
                         tool_name=tool_name,
                         arguments=arguments,
@@ -288,11 +353,12 @@ class SimpleSGRAgent:
 
             calls_made.append(
                 {
-                    "step": step_index,
+                    "decision": decision_index,
                     "tool": tool_name,
                     "arguments": self._compact_arguments(arguments),
                     "status": feedback.get("status", "unknown"),
                     "reward": feedback.get("reward"),
+                    "server_call": server_call,
                 }
             )
             last_feedback = feedback
@@ -300,13 +366,14 @@ class SimpleSGRAgent:
                 self._write_trace(
                     "local_rejection",
                     task_id=session.task_id,
-                    step=step_index,
+                    step=decision_index,
                     tool_name=tool_name,
                     feedback=feedback,
                 )
 
         raise RuntimeError(
-            f"Agent hit the {self.max_steps}-step limit without finish_investigation."
+            f"Agent hit the {max_decisions}-decision safety limit without "
+            "finish_investigation."
         )
 
     @staticmethod
@@ -318,14 +385,14 @@ class SimpleSGRAgent:
         calls_made: list[dict[str, Any]],
         current_state: str,
         last_feedback: dict[str, Any] | None,
-        step_index: int,
-        steps_remaining: int,
+        decision_index: int,
+        calls_remaining: int,
         seconds_remaining: float,
     ) -> list[dict[str, Any]]:
         urgency = ""
-        if steps_remaining == 1:
-            urgency = "This is the final step. You MUST call finish_investigation now."
-        elif steps_remaining <= 3:
+        if calls_remaining == 1:
+            urgency = "Only the final report call remains. MUST call finish_investigation now."
+        elif calls_remaining <= 3:
             urgency = (
                 "Finish now unless exactly one missing fact can materially change the verdict "
                 "or required report artifacts."
@@ -348,8 +415,8 @@ class SimpleSGRAgent:
                             "last_tool_feedback": last_feedback,
                         },
                         "budget": {
-                            "current_step": step_index,
-                            "steps_remaining_including_this_one": steps_remaining,
+                            "decision_number": decision_index,
+                            "server_calls_remaining_including_finish": calls_remaining,
                             "seconds_remaining_approx": round(seconds_remaining, 1),
                             "instruction": urgency,
                         },
@@ -366,6 +433,30 @@ class SimpleSGRAgent:
     @staticmethod
     def _compact_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
         return {key: value for key, value in arguments.items() if key != "reasoning"}
+
+    @staticmethod
+    def _report_audit_findings(request: FinishInvestigationRequest) -> list[str]:
+        submission = request.submission
+        findings: list[str] = []
+        if submission.verdict == "benign":
+            if not any(
+                evidence.anchor == "relation"
+                for evidence in submission.legitimacy_evidence
+            ):
+                findings.append("Candidate has no causal relation anchor.")
+            absence_phrases = (
+                "no clear malicious",
+                "no definitive",
+                "no malicious",
+                "not observed",
+                "absence of",
+            )
+            if any(phrase in submission.reasoning.lower() for phrase in absence_phrases):
+                findings.append(
+                    "Candidate relies on absence of malicious evidence; replace this with "
+                    "positive legitimacy evidence or reconsider the verdict."
+                )
+        return findings
 
     @staticmethod
     def _is_fatal_provider_error(error: Exception) -> bool:

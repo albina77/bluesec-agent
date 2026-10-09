@@ -38,7 +38,7 @@ def test_env_example_contains_complete_runnable_configuration() -> None:
     assert settings.llm_base_url == "https://provider.example/v1"
     assert settings.llm_api_key.get_secret_value() == "replace-with-your-key"
     assert settings.llm_default_model == "provider/model-name"
-    assert settings.agent_max_steps == 14
+    assert settings.agent_max_steps == 10
     assert settings.agent_max_task_seconds == 240
 
 

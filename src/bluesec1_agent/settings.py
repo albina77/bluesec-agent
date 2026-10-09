@@ -72,7 +72,7 @@ class Settings(BaseSettings):
         min_length=1,
     )
     agent_max_steps: int = Field(
-        default=14,
+        default=10,
         validation_alias="BLUESEC_AGENT_MAX_STEPS",
         ge=1,
         le=100,
