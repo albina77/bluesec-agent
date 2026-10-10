@@ -335,7 +335,7 @@ class SimpleSGRAgent:
                 exclude={"tool"},
                 exclude_none=True,
             )
-            if isinstance(function, FinishInvestigationRequest) and not validation_errors:
+            if isinstance(function, FinishInvestigationRequest):
                 last_finish_arguments = arguments
             fingerprint = self._call_fingerprint(tool_name, arguments)
             tool_call_id = f"decision_{decision_index}"
