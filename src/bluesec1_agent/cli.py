@@ -54,6 +54,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Validate provider structured output without opening a competition run.",
     )
+    parser.add_argument(
+        "--profile",
+        choices=("baseline", "candidate"),
+        default="candidate",
+        help="Comparable behavior profile recorded in run artifacts.",
+    )
     return parser
 
 
@@ -91,6 +97,13 @@ async def run(args: argparse.Namespace) -> None:
         print(json.dumps({"provider_preflight": "passed", "remote_run_opened": False}))
         return
     agent_name = args.agent_name or settings.agent_name
+    profile_defaults = {
+        "baseline": {"analysis_parallelism": 1, "review_final_report": False},
+        "candidate": {
+            "analysis_parallelism": settings.agent_analysis_parallelism,
+            "review_final_report": True,
+        },
+    }[args.profile]
     verify_tls = (
         settings.scenario_runtime_verify_tls if args.verify_tls is None else args.verify_tls
     )
@@ -117,8 +130,10 @@ async def run(args: argparse.Namespace) -> None:
             max_task_seconds=settings.agent_max_task_seconds,
             max_tasks=args.max_tasks,
             task_concurrency=args.task_concurrency or settings.agent_task_concurrency,
-            analysis_parallelism=settings.agent_analysis_parallelism,
+            analysis_parallelism=profile_defaults["analysis_parallelism"],
+            review_final_report=profile_defaults["review_final_report"],
             trace_dir=settings.agent_trace_dir,
+            profile=args.profile,
         ).run(client)
 
     print(json.dumps(result.model_dump(mode="json"), indent=2, sort_keys=True))

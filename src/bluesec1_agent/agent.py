@@ -97,6 +97,7 @@ class SimpleSGRAgent:
         task_concurrency: int = 1,
         analysis_parallelism: int = 1,
         trace_dir: Path | None = None,
+        profile: str = "candidate",
     ) -> None:
         """Store the LLM dependency and per-task step limit.
 
@@ -129,6 +130,7 @@ class SimpleSGRAgent:
         self.task_concurrency = task_concurrency
         self.analysis_parallelism = analysis_parallelism
         self.trace_dir = trace_dir
+        self.profile = profile
         self._trace: JsonlTraceWriter | None = None
 
     async def run(self, client: RemoteBenchmarkClient) -> AgentRunResult:
@@ -156,7 +158,7 @@ class SimpleSGRAgent:
                     "run_id": remote_run.run_id,
                     "model": getattr(self.llm, "model", None),
                     "prompt_version": "evidence-ledger-v1",
-                    "profile": "candidate",
+                    "profile": self.profile,
                 },
             )
             self._write_trace("run_started", run_id=remote_run.run_id)
