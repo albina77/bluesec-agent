@@ -30,11 +30,28 @@ competition site, and `LLM_BASE_URL`,
 `LLM_API_KEY`, `LLM_DEFAULT_MODEL` from your provider. Set `AGENT_NAME` too —
 it is shown next to your runs in the competition interface.
 Pin `SCENARIO_RUNTIME_ARENA=practice` while testing, then explicitly change it
-for the final arena. The agent defaults to 24 calls and 240 seconds per task;
-both limits are configurable in `.env`.
+for the final arena. The agent defaults to 24 calls, 50 model decisions
+(`BLUESEC_AGENT_MAX_DECISIONS`), and 240 seconds per task; limits are configurable in `.env`.
 The current competition runtime permits one active task per run. Inside that task,
-the agent uses two parallel hypothesis candidates at the initial decision and final
-report audit. Both concurrency values remain configurable in `.env`.
+the agent uses two parallel hypothesis candidates at the initial decision.
+Both concurrency values remain configurable in `.env`.
+
+The candidate profile reviews every proposed report with a separate strict SGR schema:
+observed facts, alternative explanation, verdict consistency, artifact completeness,
+response proportionality, and unsupported claims. All six checkpoints are mandatory;
+approval requires every check to pass and citations to observed evidence. The reviewer
+uses the same configured model in a separate conversation without investigator plans.
+Structured output enforces the checklist, not the truth of the model's conclusions.
+
+The bounded flow is draft → review → optional evidence/correction → verification → submit.
+At most one additional advertised evidence tool call is allowed, preserving the final
+server call. Review/correction calls count against the model-decision budget and task
+deadline, but not the server-tool budget. The validator remains active in finish-only mode.
+Invalid reviews, unresolved corrections, or insufficient validation time fail closed
+(task abort), rather than submitting an unapproved report. The baseline profile disables
+this semantic review but retains local evidence validation.
+Trace events `final_review`, `report_correction`, and validator-sourced `tool_result`
+record the checklist, correction, evidence call, and model usage.
 
 Start the agent with `--env-file` so gRPC receives the resolver setting from
 the environment as well as the application settings.

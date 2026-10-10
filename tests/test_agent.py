@@ -4,7 +4,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
+import pytest
+
 from bluesec1_agent.agent import SimpleSGRAgent
+from bluesec1_agent.budget import InvestigationBudget
 from bluesec1_agent.models import (
     FinishInvestigationArtifact,
     FinishInvestigationRequest,
@@ -12,6 +15,7 @@ from bluesec1_agent.models import (
     MaliciousFinishInvestigationSubmission,
     NextStep,
 )
+from bluesec1_agent.validation import ReportReview
 from bluesec1_client import (
     PublicTask,
     RemoteBenchmarkClient,
@@ -19,6 +23,49 @@ from bluesec1_client import (
     TaskResult,
     ToolCallResult,
 )
+
+
+def test_finish_reserve_starts_five_proposals_before_limit() -> None:
+    budget = InvestigationBudget(max_calls=24, max_proposals=34, timeout_seconds=240)
+    budget.proposals = 28
+    assert not budget.finish_only
+    budget.proposal()
+    assert budget.finish_only
+
+
+def test_search_fingerprint_preserves_pagination_and_order() -> None:
+    fingerprint = SimpleSGRAgent._call_fingerprint
+    assert fingerprint("search", {"page_id": "a"}) != fingerprint("search", {"page_id": "b"})
+    assert fingerprint("search", {"sort_order": "asc"}) != fingerprint(
+        "search", {"sort_order": "desc"}
+    )
+    assert fingerprint("get_entity", {"entity_id": "a", "reasoning": "x"}) == fingerprint(
+        "get_entity", {"entity_id": "a", "reasoning": "y"}
+    )
+
+
+def test_invalid_finish_is_never_submitted_by_fallback() -> None:
+    finish = NextStep(
+        current_state="Finish", plan_remaining_steps_brief=["Finish"], task_completed=True,
+        function=FinishInvestigationRequest(
+            tool="finish_investigation",
+            submission=MaliciousFinishInvestigationSubmission(
+                verdict="malicious", reasoning="Test",
+                ir_artifacts=[FinishInvestigationArtifact(
+                    entity_id="unknown-host", kind="host_to_isolate",
+                )],
+            ),
+        ),
+    )
+    session = FakeSession()
+    llm = FakeStepClient([finish] * 11)
+    with pytest.raises(RuntimeError, match="safety limit"):
+        asyncio.run(SimpleSGRAgent(
+            llm, max_steps=1, max_decisions=11, review_final_report=False,
+        )._investigate(
+            cast(RemoteBenchmarkSession, session)
+        ))
+    assert session.calls == []
 
 
 class FakeStepClient:
@@ -32,6 +79,18 @@ class FakeStepClient:
         """
         self.steps = list(steps)
         self.requests: list[list[dict[str, Any]]] = []
+        self.review_requests: list[list[dict[str, Any]]] = []
+
+    async def review_report(self, messages: list[dict[str, Any]]) -> ReportReview:
+        self.review_requests.append(messages)
+        check = {"status": "pass", "finding": "Observed test evidence", "evidence_ids": ["host-1"]}
+        return ReportReview.model_validate({
+            **{key: check for key in (
+                "observed_facts", "alternative_explanation", "verdict_consistency",
+                "artifact_completeness", "response_proportionality", "unsupported_claims",
+            )},
+            "decision": "approve", "corrections": [], "evidence_request": None,
+        })
 
     async def next_step(self, messages: list[dict[str, Any]]) -> NextStep:
         """Record one conversation and return its next prepared step.
@@ -330,14 +389,14 @@ def test_duplicate_decision_uses_cache_without_spending_server_call() -> None:
     session = FakeSession()
 
     asyncio.run(
-        SimpleSGRAgent(llm, max_steps=2, review_final_report=False)._investigate(
+        SimpleSGRAgent(llm, max_steps=3, review_final_report=False)._investigate(
             cast(RemoteBenchmarkSession, session)
         )
     )
 
     assert [name for name, _ in session.calls] == ["get_entity", "finish_investigation"]
     third_prompt = json.loads(llm.requests[2][-1]["content"])
-    assert third_prompt["budget"]["server_calls_remaining_including_finish"] == 1
+    assert third_prompt["budget"]["server_calls_remaining_including_finish"] == 2
     assert third_prompt["investigation_state"]["last_tool_feedback"]["status"] == "cached"
 
 
@@ -374,17 +433,15 @@ def test_final_report_gets_one_local_review_before_submission() -> None:
     session = FakeSession()
 
     asyncio.run(
-        SimpleSGRAgent(llm, max_steps=1)._investigate(
+        SimpleSGRAgent(llm, max_steps=3)._investigate(
             cast(RemoteBenchmarkSession, session)
         )
     )
 
     assert [name for name, _ in session.calls] == ["finish_investigation"]
-    review_prompt = json.loads(llm.requests[1][-1]["content"])
-    assert (
-        review_prompt["investigation_state"]["last_tool_feedback"]["status"]
-        == "review_required"
-    )
+    assert len(llm.review_requests) == 1
+    review_prompt = json.loads(llm.review_requests[0][-1]["content"])
+    assert review_prompt["candidate"]["submission"]["verdict"] == "malicious"
 
 
 def test_run_leases_two_tasks_per_batch() -> None:

@@ -71,6 +71,12 @@ class Settings(BaseSettings):
         validation_alias="LLM_REASONING_EFFORT",
         min_length=1,
     )
+    agent_max_decisions: int = Field(
+        default=50,
+        validation_alias="BLUESEC_AGENT_MAX_DECISIONS",
+        ge=1,
+        le=200,
+    )
     agent_max_steps: int = Field(
         default=24,
         validation_alias="BLUESEC_AGENT_MAX_STEPS",

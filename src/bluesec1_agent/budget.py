@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from time import monotonic
 
@@ -10,7 +11,7 @@ class InvestigationBudget:
     max_proposals: int
     timeout_seconds: float
     finish_reserve_seconds: float = 45.0
-    clock: callable = field(default=monotonic, repr=False)
+    clock: Callable[[], float] = field(default=monotonic, repr=False)
     calls: int = 0
     proposals: int = 0
     started_at: float = field(init=False)
@@ -24,7 +25,7 @@ class InvestigationBudget:
 
     @property
     def finish_only(self) -> bool:
-        return (self.calls >= self.max_calls - 1 or self.proposals >= self.max_proposals - 1
+        return (self.calls >= self.max_calls - 1 or self.proposals >= self.max_proposals - 5
                 or self.remaining_seconds <= self.finish_reserve_seconds)
 
     @property

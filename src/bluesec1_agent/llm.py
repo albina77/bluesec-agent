@@ -15,6 +15,7 @@ from bluesec1_agent.models import (
     FinishInvestigationRequest,
     NextStep,
 )
+from bluesec1_agent.validation import REVIEW_RESPONSE_FORMAT, ReportReview
 
 STRUCTURED_OUTPUT_INSTRUCTION = """
 Every assistant reply must be exactly one JSON object with these top-level fields:
@@ -50,6 +51,10 @@ class StructuredStepClient(Protocol):
 
     async def next_step(self, messages: list[dict[str, Any]]) -> NextStep:
         """Generate and validate one investigation step."""
+        ...
+
+    async def review_report(self, messages: list[dict[str, Any]]) -> ReportReview:
+        """Return all mandatory validation checkpoints."""
         ...
 
 
@@ -109,6 +114,31 @@ class OpenAIStructuredStepClient:
         """Close the provider transport created by this wrapper."""
         if self._owns_client:
             await self._client.close()
+
+    async def review_report(self, messages: list[dict[str, Any]]) -> ReportReview:
+        """Independent strict-schema review, with one bounded schema repair."""
+        history = list(messages)
+        for attempt in range(2):
+            request: dict[str, Any] = {
+                "model": self.model, "messages": history,
+                "response_format": REVIEW_RESPONSE_FORMAT,
+                "max_completion_tokens": self.max_completion_tokens,
+            }
+            if self.reasoning_effort is not None:
+                request["reasoning_effort"] = self.reasoning_effort
+            response = await self._client.chat.completions.create(**request)
+            self.last_usage = response_usage(response)
+            raw = extract_raw_content(response)
+            try:
+                return ReportReview.model_validate_json(raw)
+            except ValueError as error:
+                if attempt:
+                    raise NextStepRequestError("Invalid report review") from error
+                history.extend([
+                    {"role": "assistant", "content": raw},
+                    {"role": "user", "content": f"Repair schema/consistency errors: {error}"},
+                ])
+        raise NextStepRequestError("Missing report review")
 
     async def next_step(self, messages: list[dict[str, Any]]) -> NextStep:
         """Return one valid `NextStep`, repairing malformed replies when possible.

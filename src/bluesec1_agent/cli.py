@@ -127,6 +127,7 @@ async def run(args: argparse.Namespace) -> None:
         result = await SimpleSGRAgent(
             llm,
             max_steps=settings.agent_max_steps,
+            max_decisions=settings.agent_max_decisions,
             max_task_seconds=settings.agent_max_task_seconds,
             max_tasks=args.max_tasks,
             task_concurrency=args.task_concurrency or settings.agent_task_concurrency,
