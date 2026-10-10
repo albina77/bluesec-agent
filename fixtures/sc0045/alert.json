@@ -1,0 +1,85 @@
+{
+  "alert_description": "Process C:\\Users\\a.ivanova\\Desktop\\Diagnosis.exe (PID: 6120) was started on host NB-AIVANOVA (IP: 10.45.50.102) at 2024-06-12T09:03:00+00:00",
+  "trigger_entities": [
+    {
+      "id": "67ba75fb-76b7-593a-96b2-e42d7f348ffe",
+      "type": "host",
+      "properties": {
+        "hostname": "NB-AIVANOVA",
+        "ad_object_id": "0e3ab56f-96a7-584b-81fe-f51b38479451",
+        "platform": "windows",
+        "os": "Windows 11 Enterprise",
+        "os_version": "10.0 (26100)",
+        "ip": "10.45.50.102",
+        "ip_addresses": null,
+        "mac_addresses": null,
+        "architecture": null,
+        "domain": "corp.local",
+        "role": "workstation",
+        "is_virtual_machine": null,
+        "boot_time": null
+      },
+      "host_id": null,
+      "timestamps": [
+        "2024-06-12T00:00:00+00:00",
+        "2024-06-12T09:00:07+00:00"
+      ]
+    },
+    {
+      "id": "befe11af-28cd-5fde-8f4e-311febd53eac",
+      "type": "windows_process",
+      "properties": {
+        "pid": 6120,
+        "parent_pid": 4360,
+        "parent_image": "C:\\Windows\\explorer.exe",
+        "image_path": "C:\\Users\\a.ivanova\\Desktop\\Diagnosis.exe",
+        "cmdline": "C:\\Users\\a.ivanova\\Desktop\\Diagnosis.exe",
+        "cwd": "C:\\Users\\a.ivanova\\Desktop\\",
+        "powershell_host": null,
+        "powershell_version": null,
+        "user_sid": "S-1-5-21-1443991235-1188304862-3207093139-4501",
+        "user": "CORP\\a.ivanova",
+        "integrity_level": "medium",
+        "session_id": 2,
+        "logon_id": "0x7a2c4",
+        "is_elevated": null,
+        "sha256": "c3f5a9b1d2e47608a1b2c3d4e5f60718293a4b5c6d7e8f901a2b3c4d5e6f7081",
+        "sha1": "E2A20F58FE089BFC697039885BA84021C0C0D134",
+        "md5": "BE47FB0D29D50FA051A165691EF021BB",
+        "original_filename": null,
+        "digital_signature": null,
+        "signed": null,
+        "signer": null,
+        "company": null,
+        "product": null,
+        "file_description": null,
+        "file_version": null,
+        "token_privileges": null,
+        "start_time": "2024-06-12T09:03:00+00:00",
+        "end_time": null,
+        "loaded_modules": null
+      },
+      "host_id": "67ba75fb-76b7-593a-96b2-e42d7f348ffe",
+      "timestamps": [
+        "2024-06-12T09:03:00+00:00",
+        "2024-06-12T09:03:02+00:00"
+      ]
+    }
+  ],
+  "trigger_relations": [
+    {
+      "id": "575565ce-4a1b-5210-83a8-223b2e4493a0",
+      "type": "hosts",
+      "source_id": "67ba75fb-76b7-593a-96b2-e42d7f348ffe",
+      "target_id": "befe11af-28cd-5fde-8f4e-311febd53eac",
+      "timestamp": null,
+      "log_sources": [
+        "Sysmon-1",
+        "WinEvt-4688"
+      ],
+      "properties": null,
+      "logon_properties": null,
+      "access_properties": null
+    }
+  ]
+}

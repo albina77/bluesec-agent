@@ -10,7 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from bluesec1_agent.llm import StructuredStepClient, render_json
 from bluesec1_agent.models import FinishInvestigationRequest, NextStep
 from bluesec1_agent.state import EvidenceLedger
-from bluesec1_agent.trace import JsonlTraceWriter
+from bluesec1_agent.trace import JsonlTraceWriter, RunArtifacts
 from bluesec1_client import (
     RemoteBenchmarkClient,
     RemoteBenchmarkSession,
@@ -148,7 +148,17 @@ class SimpleSGRAgent:
             raise RuntimeError("RemoteBenchmarkClient must be open before running the agent.")
 
         if self.trace_dir is not None:
-            self._trace = JsonlTraceWriter(self.trace_dir, remote_run.run_id)
+            self._trace = RunArtifacts(
+                self.trace_dir,
+                remote_run.run_id,
+                manifest={
+                    "schema_version": 1,
+                    "run_id": remote_run.run_id,
+                    "model": getattr(self.llm, "model", None),
+                    "prompt_version": "evidence-ledger-v1",
+                    "profile": "candidate",
+                },
+            )
             self._write_trace("run_started", run_id=remote_run.run_id)
 
         task_results: list[TaskResult] = []
@@ -198,6 +208,8 @@ class SimpleSGRAgent:
             task_results=task_results,
         )
         self._write_trace("run_finished", result=result.model_dump(mode="json"))
+        if isinstance(self._trace, RunArtifacts):
+            self._trace.close("completed", task_count=len(task_results))
         return result
 
     async def _run_task(self, session: RemoteBenchmarkSession) -> TaskResult:
