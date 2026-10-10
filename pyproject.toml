@@ -18,6 +18,7 @@ dependencies = [
 
 [project.scripts]
 bluesec1-agent = "bluesec1_agent.cli:main"
+bluesec1-eval = "bluesec1_agent.evaluation:main"
 
 [build-system]
 requires = ["hatchling"]

@@ -1,12 +1,12 @@
 import asyncio
 import json
-import time
 from pathlib import Path
 from typing import Any
 
 from loguru import logger
 from pydantic import BaseModel, ConfigDict, Field
 
+from bluesec1_agent.budget import InvestigationBudget
 from bluesec1_agent.llm import StructuredStepClient, render_json
 from bluesec1_agent.models import FinishInvestigationRequest, NextStep
 from bluesec1_agent.state import EvidenceLedger
@@ -267,15 +267,18 @@ class SimpleSGRAgent:
         call_cache: dict[str, dict[str, Any]] = {}
         current_state = "Only the initial alert has been reviewed."
         last_feedback: dict[str, Any] | None = None
-        started_at = time.monotonic()
+        budget = InvestigationBudget(
+            max_calls=self.max_steps,
+            max_proposals=self.max_steps + 10,
+            timeout_seconds=self.max_task_seconds,
+        )
         remote_calls = 0
         max_decisions = self.max_steps + 10
         final_review_complete = not self.review_final_report
 
         for decision_index in range(1, max_decisions + 1):
-            elapsed_seconds = time.monotonic() - started_at
-            calls_remaining = self.max_steps - remote_calls
-            seconds_remaining = max(0.0, self.max_task_seconds - elapsed_seconds)
+            calls_remaining = self.max_steps - budget.calls
+            seconds_remaining = budget.remaining_seconds
             messages = self._step_messages(
                 public_observation=public_observation,
                 tool_specs=tool_specs,
@@ -307,6 +310,7 @@ class SimpleSGRAgent:
                 task_id=session.task_id,
                 decision_index=decision_index,
             )
+            budget.proposal()
             current_state = step.current_state
             function = step.function
             validation_errors: list[str] = []
@@ -398,7 +402,7 @@ class SimpleSGRAgent:
                         tool_name=tool_name,
                         arguments=arguments,
                     )
-                elif tool_name != "finish_investigation" and calls_remaining <= 1:
+                elif tool_name != "finish_investigation" and budget.finish_only:
                     feedback = {
                         "tool_name": tool_name,
                         "status": "error",
@@ -408,6 +412,7 @@ class SimpleSGRAgent:
                         ),
                     }
                 else:
+                    budget.call()
                     remote_calls += 1
                     server_call = True
                     response = await session.call_tool(tool_name, arguments)

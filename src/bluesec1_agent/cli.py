@@ -49,6 +49,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Override SCENARIO_RUNTIME_VERIFY_TLS.",
     )
+    parser.add_argument(
+        "--preflight",
+        action="store_true",
+        help="Validate provider structured output without opening a competition run.",
+    )
     return parser
 
 
@@ -69,6 +74,22 @@ async def run(args: argparse.Namespace) -> None:
         max_retries=settings.llm_max_step_retries,
         reasoning_effort=settings.llm_reasoning_effort,
     )
+    if args.preflight:
+        async with llm:
+            await llm.next_step(
+                [
+                    {"role": "system", "content": "Return one valid NextStep JSON object."},
+                    {
+                        "role": "user",
+                        "content": (
+                            "Synthetic provider preflight. Call get_entity with entity_id "
+                            "synthetic-process. This is not a real task and no tool executes."
+                        ),
+                    },
+                ]
+            )
+        print(json.dumps({"provider_preflight": "passed", "remote_run_opened": False}))
+        return
     agent_name = args.agent_name or settings.agent_name
     verify_tls = (
         settings.scenario_runtime_verify_tls if args.verify_tls is None else args.verify_tls
