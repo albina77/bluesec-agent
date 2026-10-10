@@ -234,7 +234,13 @@ class SimpleSGRAgent:
             if self._is_fatal_provider_error(exc):
                 self._write_trace("task_result", result=task_result.model_dump(mode="json"))
                 raise
-        self._write_trace("task_result", result=task_result.model_dump(mode="json"))
+        self._write_trace(
+            "task_result",
+            task_id=session.task_id,
+            result=task_result.model_dump(mode="json"),
+            tool_calls=task_result.tool_calls,
+            completion_reason=task_result.completion_reason,
+        )
         return task_result
 
     async def _investigate(self, session: RemoteBenchmarkSession) -> TaskResult:
@@ -277,6 +283,7 @@ class SimpleSGRAgent:
         remote_calls = 0
         max_decisions = self.max_steps + 10
         final_review_complete = not self.review_final_report
+        last_finish_arguments: dict[str, Any] | None = None
 
         for decision_index in range(1, max_decisions + 1):
             calls_remaining = self.max_steps - budget.calls
@@ -328,6 +335,8 @@ class SimpleSGRAgent:
                 exclude={"tool"},
                 exclude_none=True,
             )
+            if isinstance(function, FinishInvestigationRequest) and not validation_errors:
+                last_finish_arguments = arguments
             fingerprint = self._call_fingerprint(tool_name, arguments)
             tool_call_id = f"decision_{decision_index}"
             server_call = False
@@ -384,7 +393,8 @@ class SimpleSGRAgent:
                     candidate_submission=arguments["submission"],
                 )
             else:
-                if tool_name != "finish_investigation" and fingerprint in call_cache:
+                semantic_fingerprint = self._call_fingerprint(tool_name, arguments)
+                if tool_name != "finish_investigation" and semantic_fingerprint in call_cache:
                     cached = call_cache[fingerprint]
                     feedback = {
                         "tool_name": tool_name,
@@ -458,6 +468,11 @@ class SimpleSGRAgent:
                     feedback=feedback,
                 )
 
+        if last_finish_arguments is not None and budget.calls < budget.max_calls:
+            budget.call()
+            response = await session.call_tool("finish_investigation", last_finish_arguments)
+            if response.task_result is not None:
+                return TaskResult.model_validate(response.task_result)
         raise RuntimeError(
             f"Agent hit the {max_decisions}-decision safety limit without "
             "finish_investigation."
@@ -514,7 +529,11 @@ class SimpleSGRAgent:
 
     @staticmethod
     def _call_fingerprint(tool_name: str, arguments: dict[str, Any]) -> str:
-        semantic_arguments = {key: value for key, value in arguments.items() if key != "reasoning"}
+        semantic_arguments = {
+            key: value for key, value in arguments.items() if key not in {"reasoning", "page_id"}
+        }
+        if tool_name == "search":
+            semantic_arguments.pop("sort_order", None)
         return f"{tool_name}:{json.dumps(semantic_arguments, sort_keys=True, default=str)}"
 
     async def _next_step_with_candidates(
